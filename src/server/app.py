@@ -15,6 +15,7 @@ from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
 from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # SQLite checkpointer
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 from psycopg_pool import AsyncConnectionPool
@@ -642,9 +643,23 @@ async def _astream_workflow_generator(
                 ):
                     yield event
                 logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
+
+        if checkpoint_url.startswith("sqlite://") or checkpoint_url.endswith(".db"):
+            # SQLite checkpointer
+            db_path = checkpoint_url.replace("sqlite://", "") if checkpoint_url.startswith("sqlite://") else checkpoint_url
+            logger.info(f"[{safe_thread_id}] Starting async SQLite checkpointer: {db_path}")
+            async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
+                logger.debug(f"[{safe_thread_id}] Attaching SQLite checkpointer to graph")
+                graph.checkpointer = checkpointer
+                graph.store = in_memory_store
+                async for event in _stream_graph_events(
+                    graph, workflow_input, workflow_config, thread_id
+                ):
+                    yield event
+                logger.debug(f"[{safe_thread_id}] Graph event streaming completed with SQLite")
     else:
         logger.debug(f"[{safe_thread_id}] No checkpointer configured, using in-memory graph")
-        # Use graph without MongoDB checkpointer
+        # Use graph without checkpointer
         logger.debug(f"[{safe_thread_id}] Starting to stream graph events")
         async for event in _stream_graph_events(
             graph, workflow_input, workflow_config, thread_id
