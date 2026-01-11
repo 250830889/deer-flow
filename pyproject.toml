@@ -45,6 +45,7 @@ dependencies = [
     "langchain-qdrant>=0.2.0,<1.0.0",
     "langgraph-checkpoint-sqlite>=2.0.11",
     "aiosqlite==0.21.0",
+    "msgpack>=1.1.2",
 ]
 
 [project.optional-dependencies]

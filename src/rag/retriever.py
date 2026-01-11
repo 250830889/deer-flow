@@ -9,10 +9,24 @@ from pydantic import BaseModel, Field
 class Chunk:
     content: str
     similarity: float
+    metadata: dict
 
-    def __init__(self, content: str, similarity: float):
+    def __init__(
+        self,
+        content: str,
+        similarity: float,
+        metadata: dict | None = None,
+    ):
         self.content = content
         self.similarity = similarity
+        self.metadata = metadata or {}
+
+    def to_dict(self) -> dict:
+        return {
+            "content": self.content,
+            "similarity": self.similarity,
+            "metadata": self.metadata,
+        }
 
 
 class Document:
@@ -23,21 +37,28 @@ class Document:
     id: str
     url: str | None = None
     title: str | None = None
-    chunks: list[Chunk] = []
+    chunks: list[Chunk]
+    metadata: dict
 
     def __init__(
         self,
         id: str,
         url: str | None = None,
         title: str | None = None,
-        chunks: list[Chunk] = [],
+        chunks: list[Chunk] | None = None,
+        metadata: dict | None = None,
     ):
         self.id = id
         self.url = url
         self.title = title
-        self.chunks = chunks
+        self.chunks = chunks or []
+        self.metadata = metadata or {}
 
-    def to_dict(self) -> dict:
+    def to_dict(
+        self,
+        include_chunks: bool = False,
+        max_chunks: int | None = None,
+    ) -> dict:
         d = {
             "id": self.id,
             "content": "\n\n".join([chunk.content for chunk in self.chunks]),
@@ -46,6 +67,13 @@ class Document:
             d["url"] = self.url
         if self.title:
             d["title"] = self.title
+        if self.metadata:
+            d["metadata"] = self.metadata
+        if include_chunks:
+            chunks = self.chunks
+            if max_chunks is not None:
+                chunks = chunks[:max_chunks]
+            d["chunks"] = [chunk.to_dict() for chunk in chunks]
         return d
 
 
@@ -79,3 +107,9 @@ class Retriever(abc.ABC):
         Query relevant documents from the resources.
         """
         pass
+
+    def ingest_documents(self, documents: list[object]) -> int:
+        """
+        Ingest documents into the underlying retriever if supported.
+        """
+        raise NotImplementedError("Ingestion is not supported by this provider.")

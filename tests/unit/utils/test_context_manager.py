@@ -101,8 +101,17 @@ class TestContextManager:
         ]
 
         compressed = limited_cm.compress_messages({"messages": messages})
-        # Should preserve system message and some recent messages
-        assert len(compressed["messages"]) == 1
+        compressed_messages = compressed["messages"]
+        # Should preserve system message, include a summary, and keep recent context
+        assert len(compressed_messages) == 4
+        assert isinstance(compressed_messages[0], SystemMessage)
+        assert compressed_messages[0].content == "You are a helpful assistant."
+        assert isinstance(compressed_messages[2], SystemMessage)
+        assert compressed_messages[2].content.startswith("[摘要]")
+        assert isinstance(compressed_messages[-1], HumanMessage)
+        assert compressed_messages[-1].content.startswith(
+            "Can you tell me a very long story"
+        )
 
     def test_compress_messages_with_preserve_prefix_message(self):
         """Test compress_messages when no system message is present"""

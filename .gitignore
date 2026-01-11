@@ -24,6 +24,13 @@ conf.yaml
 .langgraph_api/
 .DS_Store
 
+# local work artifacts
+.agent/
+.trae/
+checkpoints.db
+traces.db
+view_history.py
+
 # coverage report
 coverage.xml
 coverage/

@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field
 
 
 class StepType(str, Enum):
-    RESEARCH = "research"
-    PROCESSING = "processing"
+        RESEARCH = "research"      # 研究类型
+        PROCESSING = "processing"   # 处理类型
 
 
 class Step(BaseModel):

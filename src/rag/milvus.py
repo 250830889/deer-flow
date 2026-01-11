@@ -12,6 +12,7 @@ from openai import OpenAI
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 from src.config.loader import get_bool_env, get_int_env, get_str_env
+from src.rag.ingestion_types import IngestedDocument
 from src.rag.retriever import Chunk, Document, Resource, Retriever
 
 logger = logging.getLogger(__name__)
@@ -459,7 +460,7 @@ class MilvusRetriever(Retriever):
                 # Query limited metadata. Empty filter returns up to limit docs.
                 results = self.client.query(
                     collection_name=self.collection_name,
-                    filter="source == 'examples'",
+                    filter="",
                     output_fields=[self.id_field, self.title_field, self.url_field],
                     limit=100,
                 )
@@ -477,9 +478,7 @@ class MilvusRetriever(Retriever):
                 # Use similarity_search_by_vector for lightweight listing.
                 # If a query is provided embed it; else use a zero vector.
                 docs: Iterable[Any] = self.client.similarity_search(
-                    query,
-                    k=100,
-                    expr="source == 'examples'",  # Limit to 100 results
+                    query, k=100, expr=""
                 )
                 for d in docs:
                     meta = getattr(d, "metadata", {}) or {}
@@ -589,7 +588,8 @@ class MilvusRetriever(Retriever):
                 for result_list in search_results:
                     for result in result_list:
                         entity = result.get("entity", {})
-                        doc_id = entity.get(self.id_field, "")
+                        chunk_id = entity.get(self.id_field, "")
+                        document_id = entity.get("document_id") or chunk_id
                         content = entity.get(self.content_field, "")
                         title = entity.get(self.title_field, "")
                         url = entity.get(self.url_field, "")
@@ -601,21 +601,40 @@ class MilvusRetriever(Retriever):
                             for resource in resources:
                                 if (
                                     url and url in resource.uri
-                                ) or doc_id in resource.uri:
+                                ) or document_id in resource.uri:
                                     doc_in_resources = True
                                     break
                             if not doc_in_resources:
                                 continue
 
                         # Create or update document
-                        if doc_id not in documents:
-                            documents[doc_id] = Document(
-                                id=doc_id, url=url, title=title, chunks=[]
+                        doc_metadata = _build_document_metadata(
+                            entity,
+                            document_id=document_id,
+                            url=url,
+                            title=title,
+                        )
+                        if document_id not in documents:
+                            documents[document_id] = Document(
+                                id=document_id,
+                                url=url,
+                                title=title,
+                                chunks=[],
+                                metadata=doc_metadata,
                             )
 
                         # Add chunk to document
-                        chunk = Chunk(content=content, similarity=score)
-                        documents[doc_id].chunks.append(chunk)
+                        chunk_metadata = _build_chunk_metadata(
+                            entity,
+                            chunk_id=chunk_id,
+                            document_id=document_id,
+                        )
+                        chunk = Chunk(
+                            content=content,
+                            similarity=score,
+                            metadata=chunk_metadata,
+                        )
+                        documents[document_id].chunks.append(chunk)
 
                 return list(documents.values())
 
@@ -629,7 +648,8 @@ class MilvusRetriever(Retriever):
 
                 for doc, score in search_results:
                     metadata = doc.metadata or {}
-                    doc_id = metadata.get(self.id_field, "")
+                    chunk_id = metadata.get(self.id_field, "")
+                    document_id = metadata.get("document_id") or chunk_id
                     title = metadata.get(self.title_field, "")
                     url = metadata.get(self.url_field, "")
                     content = doc.page_content
@@ -638,21 +658,40 @@ class MilvusRetriever(Retriever):
                     if resources:
                         doc_in_resources = False
                         for resource in resources:
-                            if (url and url in resource.uri) or doc_id in resource.uri:
+                            if (url and url in resource.uri) or document_id in resource.uri:
                                 doc_in_resources = True
                                 break
                         if not doc_in_resources:
                             continue
 
                     # Create or update document
-                    if doc_id not in documents:
-                        documents[doc_id] = Document(
-                            id=doc_id, url=url, title=title, chunks=[]
+                    doc_metadata = _build_document_metadata(
+                        metadata,
+                        document_id=document_id,
+                        url=url,
+                        title=title,
+                    )
+                    if document_id not in documents:
+                        documents[document_id] = Document(
+                            id=document_id,
+                            url=url,
+                            title=title,
+                            chunks=[],
+                            metadata=doc_metadata,
                         )
 
                     # Add chunk to document
-                    chunk = Chunk(content=content, similarity=score)
-                    documents[doc_id].chunks.append(chunk)
+                    chunk_metadata = _build_chunk_metadata(
+                        metadata,
+                        chunk_id=chunk_id,
+                        document_id=document_id,
+                    )
+                    chunk = Chunk(
+                        content=content,
+                        similarity=score,
+                        metadata=chunk_metadata,
+                    )
+                    documents[document_id].chunks.append(chunk)
 
                 return list(documents.values())
 
@@ -772,6 +811,29 @@ class MilvusRetriever(Retriever):
         """Best-effort cleanup when instance is garbage collected."""
         self.close()
 
+    def ingest_documents(self, documents: list[IngestedDocument]) -> int:
+        if not self.client:
+            self._connect()
+        inserted = 0
+        for doc in documents:
+            doc_metadata = dict(doc.metadata)
+            doc_metadata.setdefault("document_id", doc.document_id)
+            doc_metadata.setdefault("source", "ingest")
+            for chunk in doc.chunks:
+                chunk_metadata = dict(doc_metadata)
+                chunk_metadata.update(chunk.metadata or {})
+                chunk_metadata.setdefault("chunk_id", chunk.chunk_id)
+                chunk_metadata.setdefault("document_id", doc.document_id)
+                self._insert_document_chunk(
+                    doc_id=chunk.chunk_id,
+                    content=chunk.content,
+                    title=doc.title or "",
+                    url=doc.url or "",
+                    metadata=chunk_metadata,
+                )
+                inserted += 1
+        return inserted
+
 
 # Backwards compatibility export (original class name kept for external imports)
 class MilvusProvider(MilvusRetriever):
@@ -786,3 +848,29 @@ def load_examples() -> None:
     if rag_provider == "milvus" and auto_load_examples:
         provider = MilvusProvider()
         provider.load_examples()
+
+
+def _build_document_metadata(
+    payload: Dict[str, Any],
+    document_id: str,
+    url: str,
+    title: str,
+) -> Dict[str, Any]:
+    metadata = {k: v for k, v in payload.items() if k != "content"}
+    metadata.setdefault("document_id", document_id)
+    if url:
+        metadata.setdefault("url", url)
+    if title:
+        metadata.setdefault("title", title)
+    return metadata
+
+
+def _build_chunk_metadata(
+    payload: Dict[str, Any],
+    chunk_id: str,
+    document_id: str,
+) -> Dict[str, Any]:
+    metadata = {k: v for k, v in payload.items() if k != "content"}
+    metadata.setdefault("chunk_id", chunk_id)
+    metadata.setdefault("document_id", document_id)
+    return metadata

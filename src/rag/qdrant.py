@@ -22,6 +22,7 @@ from qdrant_client.models import (
 )
 
 from src.config.loader import get_bool_env, get_int_env, get_str_env
+from src.rag.ingestion_types import IngestedDocument
 from src.rag.retriever import Chunk, Document, Resource, Retriever
 
 logger = logging.getLogger(__name__)
@@ -300,9 +301,7 @@ class QdrantProvider(Retriever):
 
         try:
             if query and self.vector_store:
-                docs = self.vector_store.similarity_search(
-                    query, k=100, filter={"source": "examples"}
-                )
+                docs = self.vector_store.similarity_search(query, k=100)
                 for d in docs:
                     meta = d.metadata or {}
                     uri = meta.get("url", "") or f"qdrant://{meta.get('id', '')}"
@@ -317,13 +316,6 @@ class QdrantProvider(Retriever):
                     )
             else:
                 all_points = self._scroll_all_points(
-                    scroll_filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="source", match=MatchValue(value="examples")
-                            )
-                        ]
-                    ),
                     with_payload=True,
                     with_vectors=False,
                 )
@@ -397,7 +389,8 @@ class QdrantProvider(Retriever):
 
         for result in search_results:
             payload = result.payload or {}
-            doc_id = payload.get("doc_id", str(result.id))
+            chunk_id = payload.get("doc_id", str(result.id))
+            document_id = payload.get("document_id") or chunk_id
             content = payload.get("content", "")
             title = payload.get("title", "")
             url = payload.get("url", "")
@@ -406,19 +399,59 @@ class QdrantProvider(Retriever):
             if resources:
                 doc_in_resources = False
                 for resource in resources:
-                    if (url and url in resource.uri) or doc_id in resource.uri:
+                    if (url and url in resource.uri) or document_id in resource.uri:
                         doc_in_resources = True
                         break
                 if not doc_in_resources:
                     continue
 
-            if doc_id not in documents:
-                documents[doc_id] = Document(id=doc_id, url=url, title=title, chunks=[])
+            doc_metadata = _build_document_metadata(
+                payload=payload,
+                document_id=document_id,
+                url=url,
+                title=title,
+            )
+            if document_id not in documents:
+                documents[document_id] = Document(
+                    id=document_id,
+                    url=url,
+                    title=title,
+                    chunks=[],
+                    metadata=doc_metadata,
+                )
 
-            chunk = Chunk(content=content, similarity=score)
-            documents[doc_id].chunks.append(chunk)
+            chunk_metadata = _build_chunk_metadata(
+                payload=payload,
+                chunk_id=chunk_id,
+                document_id=document_id,
+            )
+            chunk = Chunk(content=content, similarity=score, metadata=chunk_metadata)
+            documents[document_id].chunks.append(chunk)
 
         return list(documents.values())
+
+    def ingest_documents(self, documents: list[IngestedDocument]) -> int:
+        if not self.client:
+            self._connect()
+        inserted = 0
+        for doc in documents:
+            doc_metadata = dict(doc.metadata)
+            doc_metadata.setdefault("document_id", doc.document_id)
+            doc_metadata.setdefault("source", "ingest")
+            for chunk in doc.chunks:
+                chunk_metadata = dict(doc_metadata)
+                chunk_metadata.update(chunk.metadata or {})
+                chunk_metadata.setdefault("chunk_id", chunk.chunk_id)
+                chunk_metadata.setdefault("document_id", doc.document_id)
+                self._insert_document_chunk(
+                    doc_id=chunk.chunk_id,
+                    content=chunk.content,
+                    title=doc.title or "",
+                    url=doc.url or "",
+                    metadata=chunk_metadata,
+                )
+                inserted += 1
+        return inserted
 
     def create_collection(self) -> None:
         if not self.client:
@@ -503,3 +536,29 @@ def load_examples() -> None:
     if rag_provider == "qdrant" and auto_load_examples:
         provider = QdrantProvider()
         provider.load_examples()
+
+
+def _build_document_metadata(
+    payload: Dict[str, Any],
+    document_id: str,
+    url: str,
+    title: str,
+) -> Dict[str, Any]:
+    metadata = {k: v for k, v in payload.items() if k != "content"}
+    metadata.setdefault("document_id", document_id)
+    if url:
+        metadata.setdefault("url", url)
+    if title:
+        metadata.setdefault("title", title)
+    return metadata
+
+
+def _build_chunk_metadata(
+    payload: Dict[str, Any],
+    chunk_id: str,
+    document_id: str,
+) -> Dict[str, Any]:
+    metadata = {k: v for k, v in payload.items() if k != "content"}
+    metadata.setdefault("chunk_id", chunk_id)
+    metadata.setdefault("document_id", document_id)
+    return metadata

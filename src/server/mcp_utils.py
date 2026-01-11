@@ -1,6 +1,10 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+## MCP工具加载工具模块
+## 该文件定义了与模型控制协议(MCP)服务器通信并加载工具的功能
+## 支持多种MCP服务器连接类型：stdio、sse和streamable_http
+
 import logging
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -11,6 +15,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+## 初始化日志记录器
 logger = logging.getLogger(__name__)
 
 

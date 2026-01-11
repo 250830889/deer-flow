@@ -31,6 +31,8 @@ from src.graph.utils import (
     reconstruct_clarification_history,
 )
 from src.llms.llm import get_configured_llm_models
+from src.observability import current_run_id, current_thread_id, trace_store
+from src.observability.utils import normalize_usage_metadata
 from src.podcast.graph.builder import build_graph as build_podcast_graph
 from src.ppt.graph.builder import build_graph as build_ppt_graph
 from src.prompt_enhancer.graph.builder import build_graph as build_prompt_enhancer_graph
@@ -299,6 +301,12 @@ def _create_event_stream_message(
             "reasoning_content"
         ]
 
+    usage_payload = normalize_usage_metadata(
+        getattr(message_chunk, "usage_metadata", None)
+    )
+    if usage_payload:
+        event_stream_message["usage"] = usage_payload
+
     if message_chunk.response_metadata.get("finish_reason"):
         event_stream_message["finish_reason"] = message_chunk.response_metadata.get(
             "finish_reason"
@@ -355,6 +363,22 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
     event_stream_message = _create_event_stream_message(
         message_chunk, message_metadata, thread_id, agent_name
     )
+    run_id = current_run_id.get()
+    if run_id:
+        event_stream_message["run_id"] = run_id
+
+    def _log_trace_event(event_type: str, payload: dict) -> None:
+        if not run_id:
+            return
+        trace_store.add_event(
+            run_id,
+            event_type,
+            payload=payload,
+            agent=payload.get("agent"),
+            node=payload.get("langgraph_node"),
+            step=str(payload.get("langgraph_step", "")),
+            token_usage=payload.get("usage"),
+        )
 
     if isinstance(message_chunk, ToolMessage):
         # Tool Message - Return the result of the tool call
@@ -370,6 +394,7 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
             logger.warning(f"[{safe_thread_id}] ToolMessage received without tool_call_id")
         
         logger.debug(f"[{safe_thread_id}] Yielding tool_call_result event")
+        _log_trace_event("tool_call_result", event_stream_message)
         yield _make_event("tool_call_result", event_stream_message)
     elif isinstance(message_chunk, AIMessageChunk):
         # AI Message - Raw message tokens
@@ -396,6 +421,7 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
                 )
             
             logger.debug(f"[{safe_thread_id}] Yielding tool_calls event")
+            _log_trace_event("tool_calls", event_stream_message)
             yield _make_event("tool_calls", event_stream_message)
         elif message_chunk.tool_call_chunks:
             # AI Message - Tool Call Chunks (streaming)
@@ -432,20 +458,23 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
                 )
             
             logger.debug(f"[{safe_thread_id}] Yielding tool_call_chunks event")
+            _log_trace_event("tool_call_chunks", event_stream_message)
             yield _make_event("tool_call_chunks", event_stream_message)
         else:
             # AI Message - Raw message tokens
             content_len = len(message_chunk.content) if isinstance(message_chunk.content, str) else 0
             logger.debug(f"[{safe_thread_id}] AIMessageChunk is raw message tokens, content_len={content_len}")
+            _log_trace_event("message_chunk", event_stream_message)
             yield _make_event("message_chunk", event_stream_message)
 
 
 async def _stream_graph_events(
-    graph_instance, workflow_input, workflow_config, thread_id
+    graph_instance, workflow_input, workflow_config, thread_id, trace_state=None
 ):
     """Stream events from the graph and process them."""
     safe_thread_id = sanitize_thread_id(thread_id)
     logger.debug(f"[{safe_thread_id}] Starting graph event stream with agent nodes")
+    run_id = current_run_id.get()
     try:
         event_count = 0
         async for agent, _, event_data in graph_instance.astream(
@@ -465,7 +494,19 @@ async def _stream_graph_events(
                         f"ns={getattr(event_data['__interrupt__'][0], 'ns', 'unknown') if isinstance(event_data['__interrupt__'], (list, tuple)) and len(event_data['__interrupt__']) > 0 else 'unknown'}, "
                         f"value_len={len(getattr(event_data['__interrupt__'][0], 'value', '')) if isinstance(event_data['__interrupt__'], (list, tuple)) and len(event_data['__interrupt__']) > 0 and hasattr(event_data['__interrupt__'][0], 'value') and hasattr(event_data['__interrupt__'][0].value, '__len__') else 'unknown'}"
                     )
-                    yield _create_interrupt_event(thread_id, event_data)
+                    interrupt_event = _create_interrupt_event(thread_id, event_data)
+                    if run_id:
+                        trace_store.add_event(
+                            run_id,
+                            "interrupt",
+                            payload={
+                                "thread_id": thread_id,
+                                "content": event_data["__interrupt__"][0].value,
+                            },
+                            agent="interrupt",
+                            node="interrupt",
+                        )
+                    yield interrupt_event
                 logger.debug(f"[{safe_thread_id}] Dict event without interrupt, skipping")
                 continue
 
@@ -490,6 +531,16 @@ async def _stream_graph_events(
         logger.debug(f"[{safe_thread_id}] Graph event stream completed. Total events: {event_count}")
     except Exception as e:
         logger.exception(f"[{safe_thread_id}] Error during graph execution")
+        if trace_state is not None:
+            trace_state["status"] = "error"
+        if run_id:
+            trace_store.add_event(
+                run_id,
+                "error",
+                payload={"thread_id": thread_id, "error": str(e)},
+                agent="system",
+                node="system",
+            )
         yield _make_event(
             "error",
             {
@@ -525,6 +576,47 @@ async def _astream_workflow_generator(
         f"auto_accepted_plan={auto_accepted_plan}, "
         f"interrupt_feedback={safe_feedback}, "
         f"interrupt_before_tools={interrupt_before_tools}"
+    )
+
+    run_title = messages[-1].get("content", "") if messages else ""
+    if isinstance(run_title, str) and len(run_title) > 120:
+        run_title = run_title[:120] + "..."
+    serialized_resources = [
+        resource.model_dump() if hasattr(resource, "model_dump") else resource
+        for resource in (resources or [])
+    ]
+    run_metadata = {
+        "max_plan_iterations": max_plan_iterations,
+        "max_step_num": max_step_num,
+        "max_search_results": max_search_results,
+        "auto_accepted_plan": auto_accepted_plan,
+        "enable_background_investigation": enable_background_investigation,
+        "report_style": report_style.value,
+        "enable_deep_thinking": enable_deep_thinking,
+        "enable_clarification": enable_clarification,
+        "max_clarification_rounds": max_clarification_rounds,
+        "interrupt_before_tools": interrupt_before_tools,
+    }
+    run_input = {
+        "messages": messages,
+        "resources": serialized_resources,
+        "locale": locale,
+    }
+    trace_state = {"status": "completed"}
+    run_id = trace_store.create_run(
+        thread_id=thread_id,
+        title=run_title,
+        input_payload=run_input,
+        metadata=run_metadata,
+    )
+    run_token = current_run_id.set(run_id)
+    thread_token = current_thread_id.set(thread_id)
+    trace_store.add_event(
+        run_id,
+        "run_start",
+        payload={"thread_id": thread_id, "input": run_input, "metadata": run_metadata},
+        agent="system",
+        node="system",
     )
     
     # Process initial messages
@@ -623,7 +715,7 @@ async def _astream_workflow_generator(
                 graph.store = in_memory_store
                 logger.debug(f"[{safe_thread_id}] Starting to stream graph events")
                 async for event in _stream_graph_events(
-                    graph, workflow_input, workflow_config, thread_id
+                    graph, workflow_input, workflow_config, thread_id, trace_state
                 ):
                     yield event
                 logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
@@ -639,7 +731,7 @@ async def _astream_workflow_generator(
                 graph.store = in_memory_store
                 logger.debug(f"[{safe_thread_id}] Starting to stream graph events")
                 async for event in _stream_graph_events(
-                    graph, workflow_input, workflow_config, thread_id
+                    graph, workflow_input, workflow_config, thread_id, trace_state
                 ):
                     yield event
                 logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
@@ -653,7 +745,7 @@ async def _astream_workflow_generator(
                 graph.checkpointer = checkpointer
                 graph.store = in_memory_store
                 async for event in _stream_graph_events(
-                    graph, workflow_input, workflow_config, thread_id
+                    graph, workflow_input, workflow_config, thread_id, trace_state
                 ):
                     yield event
                 logger.debug(f"[{safe_thread_id}] Graph event streaming completed with SQLite")
@@ -662,10 +754,21 @@ async def _astream_workflow_generator(
         # Use graph without checkpointer
         logger.debug(f"[{safe_thread_id}] Starting to stream graph events")
         async for event in _stream_graph_events(
-            graph, workflow_input, workflow_config, thread_id
+            graph, workflow_input, workflow_config, thread_id, trace_state
         ):
             yield event
         logger.debug(f"[{safe_thread_id}] Graph event streaming completed")
+
+    trace_store.add_event(
+        run_id,
+        "run_end",
+        payload={"thread_id": thread_id, "status": trace_state["status"]},
+        agent="system",
+        node="system",
+    )
+    trace_store.update_run_status(run_id, trace_state["status"])
+    current_run_id.reset(run_token)
+    current_thread_id.reset(thread_token)
 
 
 def _make_event(event_type: str, data: dict[str, any]):
@@ -912,3 +1015,30 @@ async def config():
         rag=RAGConfigResponse(provider=SELECTED_RAG_PROVIDER),
         models=get_configured_llm_models(),
     )
+
+
+@app.get("/api/traces/runs")
+async def list_trace_runs(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    return {"runs": trace_store.list_runs(limit=limit, offset=offset)}
+
+
+@app.get("/api/traces/runs/{run_id}")
+async def get_trace_run(run_id: str):
+    run = trace_store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Trace run not found")
+    return run
+
+
+@app.get("/api/traces/runs/{run_id}/events")
+async def get_trace_events(
+    run_id: str,
+    since_id: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    return {
+        "events": trace_store.get_events(run_id=run_id, since_id=since_id, limit=limit)
+    }

@@ -101,15 +101,18 @@ def test_build_base_graph_adds_nodes_and_edges(MockStateGraph):
 
 
 @patch("src.graph.builder._build_base_graph")
-@patch("src.graph.builder.MemorySaver")
-def test_build_graph_with_memory_uses_memory(MockMemorySaver, mock_build_base_graph):
+@patch("src.graph.builder.SqliteSaver")
+def test_build_graph_with_memory_uses_sqlite_saver(
+    MockSqliteSaver, mock_build_base_graph
+):
     mock_builder = MagicMock()
     mock_build_base_graph.return_value = mock_builder
     mock_memory = MagicMock()
-    MockMemorySaver.return_value = mock_memory
+    MockSqliteSaver.from_conn_string.return_value = mock_memory
 
     builder_mod.build_graph_with_memory()
 
+    MockSqliteSaver.from_conn_string.assert_called_once_with("checkpoints.db")
     mock_builder.compile.assert_called_once_with(checkpointer=mock_memory)
 
 

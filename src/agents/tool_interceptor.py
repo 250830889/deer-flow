@@ -1,26 +1,35 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+## 导入必要的模块
 import json
 import logging
-from typing import Any, Callable, List, Optional
+import time
+from typing import Any, List, Optional
+from uuid import uuid4
 
+## 导入LangChain核心工具和LangGraph类型
 from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 
+## 导入日志清理工具，用于安全记录敏感信息
 from src.utils.log_sanitizer import (
     sanitize_feedback,
     sanitize_log_input,
     sanitize_tool_name,
 )
+from src.observability import get_current_run_id, trace_store
 
+## 初始化日志记录器
 logger = logging.getLogger(__name__)
 
 
 class ToolInterceptor:
+    ## 工具拦截器类，用于在指定工具执行前触发中断，实现人工审核机制
     """Intercepts tool calls and triggers interrupts for specified tools."""
 
     def __init__(self, interrupt_before_tools: Optional[List[str]] = None):
+        ## 初始化拦截器，设置需要中断的工具列表
         """Initialize the interceptor with list of tools to interrupt before.
 
         Args:
@@ -33,6 +42,7 @@ class ToolInterceptor:
         )
 
     def should_interrupt(self, tool_name: str) -> bool:
+        ## 检查指定工具是否应该触发中断
         """Check if execution should be interrupted before this tool.
 
         Args:
@@ -48,6 +58,7 @@ class ToolInterceptor:
 
     @staticmethod
     def _format_tool_input(tool_input: Any) -> str:
+        ## 格式化工具输入，以便在中断消息中显示
         """Format tool input for display in interrupt messages.
 
         Attempts to format as JSON for better readability, with fallback to string representation.
@@ -62,8 +73,10 @@ class ToolInterceptor:
             return "No input"
 
         # Try to serialize as JSON first for better readability
+        ## 尝试将输入序列化为JSON以提高可读性
         try:
             # Handle dictionaries and other JSON-serializable objects
+            ## 处理字典和其他可JSON序列化的对象
             if isinstance(tool_input, (dict, list, tuple)):
                 return json.dumps(tool_input, indent=2, default=str)
             elif isinstance(tool_input, str):
@@ -71,15 +84,18 @@ class ToolInterceptor:
             else:
                 # For other types, try to convert to dict if it has __dict__
                 # Otherwise fall back to string representation
+                ## 对于其他类型，尝试转换为字典（如果有__dict__属性），否则使用字符串表示
                 return str(tool_input)
         except (TypeError, ValueError):
             # JSON serialization failed, use string representation
+            ## JSON序列化失败时，使用字符串表示
             return str(tool_input)
 
     @staticmethod
     def wrap_tool(
-        tool: BaseTool, interceptor: "ToolInterceptor"
+        tool: BaseTool, interceptor: "ToolInterceptor", agent_name: Optional[str] = None
     ) -> BaseTool:
+        ## 为工具添加中断逻辑的包装器
         """Wrap a tool to add interrupt logic by creating a wrapper.
 
         Args:
@@ -94,16 +110,32 @@ class ToolInterceptor:
         logger.debug(f"Wrapping tool '{safe_tool_name}' with interrupt capability")
 
         def intercepted_func(*args: Any, **kwargs: Any) -> Any:
+            ## 执行工具时检查是否需要中断
             """Execute the tool with interrupt check."""
             tool_name = tool.name
             safe_tool_name_local = sanitize_tool_name(tool_name)
             logger.debug(f"[ToolInterceptor] Executing tool: {safe_tool_name_local}")
             
             # Format tool input for display
+            ## 格式化工具输入以便显示
             tool_input = args[0] if args else kwargs
             tool_input_repr = ToolInterceptor._format_tool_input(tool_input)
             safe_tool_input = sanitize_log_input(tool_input_repr, max_length=100)
             logger.debug(f"[ToolInterceptor] Tool input: {safe_tool_input}")
+            run_id = get_current_run_id()
+            call_id = uuid4().hex
+            start_time = time.perf_counter()
+            if run_id:
+                trace_store.add_event(
+                    run_id,
+                    "tool_start",
+                    payload={
+                        "tool": tool_name,
+                        "input": tool_input_repr,
+                        "call_id": call_id,
+                    },
+                    agent=agent_name,
+                )
 
             should_interrupt = interceptor.should_interrupt(tool_name)
             logger.debug(f"[ToolInterceptor] should_interrupt={should_interrupt} for tool '{safe_tool_name_local}'")
@@ -117,6 +149,7 @@ class ToolInterceptor:
                 )
                 
                 # Trigger interrupt and wait for user feedback
+                ## 触发中断并等待用户反馈
                 try:
                     feedback = interrupt(
                         f"About to execute tool: '{tool_name}'\n\nInput:\n{tool_input_repr}\n\nApprove execution?"
@@ -130,11 +163,24 @@ class ToolInterceptor:
                 logger.debug(f"[ToolInterceptor] Processing feedback approval for '{safe_tool_name_local}'")
                 
                 # Check if user approved
+                ## 检查用户是否批准执行
                 is_approved = ToolInterceptor._parse_approval(feedback)
                 logger.info(f"[ToolInterceptor] Tool '{safe_tool_name_local}' approval decision: {is_approved}")
                 
                 if not is_approved:
                     logger.warning(f"[ToolInterceptor] User rejected execution of tool '{safe_tool_name_local}'")
+                    if run_id:
+                        trace_store.add_event(
+                            run_id,
+                            "tool_rejected",
+                            payload={
+                                "tool": tool_name,
+                                "input": tool_input_repr,
+                                "call_id": call_id,
+                                "reason": "user_rejected",
+                            },
+                            agent=agent_name,
+                        )
                     return {
                         "error": f"Tool execution rejected by user",
                         "tool": tool_name,
@@ -144,25 +190,56 @@ class ToolInterceptor:
                 logger.info(f"[ToolInterceptor] User approved execution of tool '{safe_tool_name_local}', proceeding")
 
             # Execute the original tool
+            ## 执行原始工具函数
             try:
                 logger.debug(f"[ToolInterceptor] Calling original function for tool '{safe_tool_name_local}'")
                 result = original_func(*args, **kwargs)
                 logger.info(f"[ToolInterceptor] Tool '{safe_tool_name_local}' execution completed successfully")
                 result_len = len(str(result))
                 logger.debug(f"[ToolInterceptor] Tool result length: {result_len}")
+                if run_id:
+                    duration_ms = (time.perf_counter() - start_time) * 1000
+                    trace_store.add_event(
+                        run_id,
+                        "tool_end",
+                        payload={
+                            "tool": tool_name,
+                            "output": result,
+                            "call_id": call_id,
+                            "status": "success",
+                        },
+                        agent=agent_name,
+                        duration_ms=duration_ms,
+                    )
                 return result
             except Exception as e:
                 logger.error(f"[ToolInterceptor] Error executing tool '{safe_tool_name_local}': {str(e)}")
+                if run_id:
+                    duration_ms = (time.perf_counter() - start_time) * 1000
+                    trace_store.add_event(
+                        run_id,
+                        "tool_error",
+                        payload={
+                            "tool": tool_name,
+                            "error": str(e),
+                            "call_id": call_id,
+                            "status": "error",
+                        },
+                        agent=agent_name,
+                        duration_ms=duration_ms,
+                    )
                 raise
 
         # Replace the function and update the tool
         # Use object.__setattr__ to bypass Pydantic validation
+        ## 替换函数并更新工具，使用object.__setattr__绕过Pydantic验证
         logger.debug(f"Attaching intercepted function to tool '{safe_tool_name}'")
         object.__setattr__(tool, "func", intercepted_func)
         return tool
 
     @staticmethod
     def _parse_approval(feedback: str) -> bool:
+        ## 解析用户反馈以确定是否批准工具执行
         """Parse user feedback to determine if tool execution was approved.
 
         Args:
@@ -178,6 +255,7 @@ class ToolInterceptor:
         feedback_lower = feedback.lower().strip()
 
         # Check for approval keywords
+        ## 检查批准关键词
         approval_keywords = [
             "approved",
             "approve",
@@ -196,6 +274,7 @@ class ToolInterceptor:
                 return True
 
         # Default to rejection if no approval keywords found
+        ## 如果未找到批准关键词，默认为拒绝
         logger.warning(
             f"No approval keywords found in feedback: {feedback}. Treating as rejection."
         )
@@ -203,8 +282,11 @@ class ToolInterceptor:
 
 
 def wrap_tools_with_interceptor(
-    tools: List[BaseTool], interrupt_before_tools: Optional[List[str]] = None
+    tools: List[BaseTool],
+    interrupt_before_tools: Optional[List[str]] = None,
+    agent_name: Optional[str] = None,
 ) -> List[BaseTool]:
+    ## 为多个工具添加中断逻辑的包装函数
     """Wrap multiple tools with interrupt logic.
 
     Args:
@@ -226,12 +308,13 @@ def wrap_tools_with_interceptor(
     wrapped_tools = []
     for tool in tools:
         try:
-            wrapped_tool = ToolInterceptor.wrap_tool(tool, interceptor)
+            wrapped_tool = ToolInterceptor.wrap_tool(tool, interceptor, agent_name)
             wrapped_tools.append(wrapped_tool)
             logger.debug(f"Wrapped tool: {tool.name}")
         except Exception as e:
             logger.error(f"Failed to wrap tool {tool.name}: {str(e)}")
             # Add original tool if wrapping fails
+            ## 如果包装失败，添加原始工具
             wrapped_tools.append(tool)
 
     logger.info(f"Successfully wrapped {len(wrapped_tools)} tools")
